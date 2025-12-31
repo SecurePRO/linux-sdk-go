@@ -28,6 +28,8 @@ import (
 	edgeimpulse "github.com/edgeimpulse/linux-sdk-go"
 	"github.com/edgeimpulse/linux-sdk-go/audio"
 	"github.com/edgeimpulse/linux-sdk-go/audio/audiocmd"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
 var (
@@ -77,6 +79,25 @@ func main0(args []string) int {
 	if len(args) != 1 {
 		usage()
 	}
+
+	// Setup MQTT Client
+	opts := mqtt.NewClientOptions()
+	opts.AddBroker("tcp://localhost:1883")
+	opts.SetUsername("observables")
+	opts.SetPassword("mqTT117obs")
+	opts.SetClientID("audio_classifier")
+	opts.SetKeepAlive(60 * time.Second)
+	opts.SetPingTimeout(10 * time.Second)
+	opts.SetAutoReconnect(true)
+
+	mqttClient := mqtt.NewClient(opts)
+	if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
+		log.Printf("MQTT connection error: %v", token.Error())
+		return 1
+	}
+	defer mqttClient.Disconnect(250)
+	log.Printf("Connected to MQTT broker")
+
 	ropts := &edgeimpulse.RunnerOpts{
 		TraceDir: traceDir,
 	}
@@ -150,6 +171,28 @@ func main0(args []string) int {
 					ev.RunnerClassifyResponse.Result.Classification = r
 				}
 				fmt.Printf("%s\n", ev.RunnerClassifyResponse)
+				fmt.Printf("%v\n", ev.RunnerClassifyResponse.Result.Classification)
+
+				// Find label with the Highest Confidence
+				var maxLabel string
+				var maxConfidence float64
+				for label, confidence := range ev.RunnerClassifyResponse.Result.Classification {
+					if confidence > maxConfidence {
+						maxConfidence = confidence
+						maxLabel = label
+					}
+				}
+
+				// Publish to MQTT
+				topic := "audio/classification"
+				payload := fmt.Sprintf(`{"label":"%s","confidence":%.2f}`, maxLabel, maxConfidence)
+				token := mqttClient.Publish(topic, 0, false, payload)
+				token.Wait()
+				if token.Error() != nil {
+					log.Printf("MQTT publish error: %v", token.Error())
+				} else if verbose {
+					log.Printf("Published to MQTT: %s", payload)
+				}
 			}
 		}
 	}
