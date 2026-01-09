@@ -39,6 +39,7 @@ var (
 	verbose     bool
 	traceDir    string
 	deviceID    string
+	mqTopic     string
 )
 
 func init() {
@@ -48,6 +49,7 @@ func init() {
 	flag.BoolVar(&verbose, "verbose", false, "print more logging")
 	flag.StringVar(&traceDir, "tracedir", "", "if set, store the parsed classify data to the named directory")
 	flag.StringVar(&deviceID, "device", "", "if set, device ID is used for microphone instead of the default microphone")
+	flag.StringVar(&mqTopic, "topic", "classification", "if set, this is the MQTT Topic that the event will publish to (default: classification)")
 }
 
 func usage() {
@@ -184,7 +186,7 @@ func main0(args []string) int {
 				}
 
 				// Publish to MQTT
-				topic := "audio/classification"
+				topic := "audio/" + mqTopic
 				payload := fmt.Sprintf(`{"label":"%s","confidence":%.2f}`, maxLabel, maxConfidence)
 				token := mqttClient.Publish(topic, 0, false, payload)
 				token.Wait()
