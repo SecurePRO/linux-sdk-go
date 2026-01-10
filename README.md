@@ -59,3 +59,48 @@ Then you can start classifying realtime sensor data. We have examples for:
 * [Audio](https://github.com/edgeimpulse/linux-sdk-go/blob/master/cmd/eimaudio/main.go) - grabs data from the microphone and classifies it in realtime.
 * [Camera](https://github.com/edgeimpulse/linux-sdk-go/blob/master/cmd/eimimage/main.go) - grabs data from a webcam and classifies it in realtime.
 * [Custom data](https://github.com/edgeimpulse/linux-sdk-go/blob/master/cmd/eimclassify/main.go) - classifies custom sensor data.
+
+# Special Observables Instructions
+
+## General Example
+
+./eimaudio -verbose -device hw:1,0 -topic glass_break /etc/eimpulse/glass_break_detection-linux-aarch64-v2.eim
+
+## Set up for multiple Instances
+
+In order for multiple instances of the eimaudio to connect to the mic, we have to create a shared mic object.
+
+Edit/Create file ~/.asoundrc
+
+pcm.shared_mic {
+    type dsnoop
+    ipc_key 5678
+    ipc_perm 0666
+    slave {
+        pcm "hw:1,0"
+        channels 1
+        rate 44100
+    }
+}
+
+Now the mic can be listened to from multiple instances at once.
+
+## Run Example
+
+### Without Verbose
+
+./eimaudio -device shared_mic -topic glass_break /etc/eimpulse/glass_break_detection-linux-aarch64-v2.eim
+
+./eimaudio -device shared_mic -topic res_smoke_alarm /etc/eimpulse/res_smoke_alarm_v5-linux-aarch64.eim
+
+### With Verbose 
+
+./eimaudio -verbose -device shared_mic -topic glass_break /etc/eimpulse/glass_break_detection-linux-aarch64-v2.eim
+
+./eimaudio -verbose -device shared_mic -topic res_smoke_alarm /etc/eimpulse/res_smoke_alarm_v5-linux-aarch64.eim
+
+## Run in the Background and record PID
+
+nohup ./eimaudio -device shared_mic -topic glass_break /etc/eimpulse/glass_break_detection-linux-aarch64-v2.eim > /dev/null 2>&1 & PID1=$!
+
+nohup ./eimaudio -device shared_mic -topic res_smoke_alarm /etc/eimpulse/res_smoke_alarm_v5-linux-aarch64.eim > /dev/null 2>&1 & PID2=$!

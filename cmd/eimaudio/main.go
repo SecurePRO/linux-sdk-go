@@ -87,7 +87,7 @@ func main0(args []string) int {
 	opts.AddBroker("tcp://localhost:1883")
 	opts.SetUsername("observables")
 	opts.SetPassword("mqTT117obs")
-	opts.SetClientID("audio_classifier")
+	opts.SetClientID("audio_classifier_" + mqTopic)
 	opts.SetKeepAlive(60 * time.Second)
 	opts.SetPingTimeout(10 * time.Second)
 	opts.SetAutoReconnect(true)
