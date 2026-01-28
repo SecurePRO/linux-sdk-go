@@ -40,6 +40,7 @@ var (
 	traceDir    string
 	deviceID    string
 	mqTopic     string
+	obsDeviceID string
 )
 
 func init() {
@@ -50,6 +51,7 @@ func init() {
 	flag.StringVar(&traceDir, "tracedir", "", "if set, store the parsed classify data to the named directory")
 	flag.StringVar(&deviceID, "device", "", "if set, device ID is used for microphone instead of the default microphone")
 	flag.StringVar(&mqTopic, "topic", "classification", "if set, this is the MQTT Topic that the event will publish to (default: classification)")
+	flag.StringVar(&obsDeviceID, "obsDeviceID", "", "Sets the device ID in the mqtt topic /device_xxxx/")
 }
 
 func usage() {
@@ -80,6 +82,12 @@ func main0(args []string) int {
 
 	if len(args) != 1 {
 		usage()
+	}
+
+	if obsDeviceID == "" {
+		fmt.Println("Error: -obsDeviceID is required")
+		flag.Usage()
+		os.Exit(1)
 	}
 
 	// Setup MQTT Client
@@ -153,6 +161,8 @@ func main0(args []string) int {
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 
 	// Keep reading classification events.
+	var previousLabel string = "" // Keep track of the previous label to supress 'background' events
+
 	for {
 		select {
 		case <-signals:
@@ -185,16 +195,27 @@ func main0(args []string) int {
 					}
 				}
 
-				// Publish to MQTT
-				topic := "audio/" + mqTopic
-				payload := fmt.Sprintf(`{"label":"%s","confidence":%.2f}`, maxLabel, maxConfidence)
-				token := mqttClient.Publish(topic, 0, false, payload)
-				token.Wait()
-				if token.Error() != nil {
-					log.Printf("MQTT publish error: %v", token.Error())
-				} else if verbose {
-					log.Printf("Published to MQTT: %s", payload)
+				// Only publish to MQTT if:
+				// 1. Label is NOT "background", OR
+				// 2. Label is "background", but previous label was NOT "background"
+				if maxLabel != "background" || previousLabel != "background" {
+					topic := "observables/device_"+ obsDeviceID + "/audio/" + mqTopic
+					payload := fmt.Sprintf(`{"label":"%s","confidence":%.2f}`, maxLabel, maxConfidence)
+					token := mqttClient.Publish(topic, 0, false, payload)
+					token.Wait()
+					if token.Error() != nil {
+						log.Printf("MQTT publish error: %v", token.Error())
+					} else if verbose {
+						log.Printf("Published to MQTT: %s", payload)
+					}
+				} else {
+					if verbose {
+						log.Printf("Suppressed background notification (already in background state)")
+					}
 				}
+
+				// Update the previous label for next iteration
+				previousLabel = maxLabel
 			}
 		}
 	}
