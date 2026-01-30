@@ -19,11 +19,14 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+	"encoding/binary"
+	"path/filepath"
 
 	edgeimpulse "github.com/edgeimpulse/linux-sdk-go"
 	"github.com/edgeimpulse/linux-sdk-go/audio"
@@ -33,14 +36,17 @@ import (
 )
 
 var (
-	listDevices bool
-	interval    time.Duration
-	mafSize     int
-	verbose     bool
-	traceDir    string
-	deviceID    string
-	mqTopic     string
-	obsDeviceID string
+	listDevices          bool
+	interval             time.Duration
+	mafSize              int
+	verbose              bool
+	traceDir             string
+	deviceID             string
+	mqTopic              string
+	obsDeviceID          string
+	recordStopDuration   time.Duration
+	recordOnTrigger      bool
+	recordDir            string
 )
 
 func init() {
@@ -52,12 +58,48 @@ func init() {
 	flag.StringVar(&deviceID, "device", "", "if set, device ID is used for microphone instead of the default microphone")
 	flag.StringVar(&mqTopic, "topic", "classification", "if set, this is the MQTT Topic that the event will publish to (default: classification)")
 	flag.StringVar(&obsDeviceID, "obsDeviceID", "", "Sets the device ID in the mqtt topic /device_xxxx/")
+	flag.DurationVar(&recordStopDuration, "recordstop", 10*time.Second, "Duration of continuous background before stopping recording.")
+	flag.BoolVar(&recordOnTrigger, "record", false, "If set, records audio when trigger label is detected.")
+	flag.StringVar(&recordDir, "recorddir", "./recordings", "directory to save audio recordings")
 }
 
 func usage() {
 	log.Println("usage: eimaudio [flags] model")
 	flag.PrintDefaults()
 	os.Exit(2)
+}
+
+// Add this function to save WAV files
+func saveWAVFile(filename string, samples []int16, sampleRate int) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// WAV header
+	dataSize := len(samples) * 2
+	// RIFF header
+	f.Write([]byte("RIFF"))
+	binary.Write(f, binary.LittleEndian, uint32(36+dataSize))
+	f.Write([]byte("WAVE"))
+	
+	// fmt chunk
+	f.Write([]byte("fmt "))
+	binary.Write(f, binary.LittleEndian, uint32(16))           // chunk size
+	binary.Write(f, binary.LittleEndian, uint16(1))            // audio format (PCM)
+	binary.Write(f, binary.LittleEndian, uint16(1))            // num channels
+	binary.Write(f, binary.LittleEndian, uint32(sampleRate))   // sample rate
+	binary.Write(f, binary.LittleEndian, uint32(sampleRate*2)) // byte rate
+	binary.Write(f, binary.LittleEndian, uint16(2))            // block align
+	binary.Write(f, binary.LittleEndian, uint16(16))           // bits per sample
+	
+	// data chunk
+	f.Write([]byte("data"))
+	binary.Write(f, binary.LittleEndian, uint32(dataSize))
+	binary.Write(f, binary.LittleEndian, samples)
+	
+	return nil
 }
 
 func main() {
@@ -88,6 +130,13 @@ func main0(args []string) int {
 		fmt.Println("Error: -obsDeviceID is required")
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	if recordOnTrigger {
+		if err := os.MkdirAll(recordDir, 0755); err != nil {
+			log.Printf("creating record directory: %v", err)
+			return 1
+		}
 	}
 
 	// Setup MQTT Client
@@ -160,13 +209,70 @@ func main0(args []string) int {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 
+	// Buffer to store recent audio samples (circular buffer)
+	bufferDuration := 3 * time.Second // Capture 3 seconds of audio
+	bufferSize := int(float64(recOpts.SampleRate) * bufferDuration.Seconds())
+	audioBuffer := make([]int16, bufferSize)
+	bufferPos := 0
+
 	// Keep reading classification events.
 	var previousLabel string = "" // Keep track of the previous label to supress 'background' events
+	var recording bool = false
+	var lastNonBackgroundTime time.Time 
+	var recordingBuffer []int16
 
+	// Create a goroutine to continuously read from the recorder
+	audioChan := make(chan []int16, 100)
+	go func() {
+		reader := recorder.Reader()
+		buf := make([]byte, 4096) // Buffer for reading bytes
+	
+		for {
+			n, err := reader.Read(buf)
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("Error reading audio: %v", err)
+				}
+				close(audioChan)
+				return
+			}
+		
+			// Convert bytes to int16 samples (16-bit signed integer, little-endian)
+			numSamples := n / 2
+			samples := make([]int16, numSamples)
+			for i := 0; i < numSamples; i++ {
+				// Little-endian: low byte first, high byte second
+				samples[i] = int16(buf[i*2]) | int16(buf[i*2+1])<<8
+			}
+		
+			audioChan <- samples
+		}
+	}()
+	
 	for {
 		select {
 		case <-signals:
 			return 1
+
+		// Handle incoming audio samples form the recorder
+		case samples, ok := <-audioChan:
+			if !ok {
+				log.Printf("Audio stream closed")
+				return 0
+			}
+		
+			// Store in circular buffer
+			for _, sample := range samples {
+				audioBuffer[bufferPos] = sample
+				bufferPos = (bufferPos + 1) % bufferSize
+			
+				// If recording, also add to recording buffer
+				if recording {
+					recordingBuffer = append(recordingBuffer, sample)
+				}
+			}
+
+		// Handle classification events
 		case ev, ok := <-ac.Events:
 			if !ok {
 				log.Printf("no more events")
@@ -194,6 +300,62 @@ func main0(args []string) int {
 						maxLabel = label
 					}
 				}
+
+				// Start recording when a non-background label is detected
+				if !recording && maxLabel != "background" {
+					recording = true
+					lastNonBackgroundTime = time.Now()
+					recordingBuffer = make([]int16, 0)
+
+					// Pre-fill with content from circular buffer (captures audio before trigger)
+					orderedSamples := make([]int16, bufferSize)
+					copy(orderedSamples, audioBuffer[bufferPos:])
+					copy(orderedSamples[bufferSize-bufferPos:], audioBuffer[:bufferPos])
+					recordingBuffer = append(recordingBuffer, orderedSamples...)
+
+					if verbose {
+						log.Printf("Started recording (triggered by: %s)", maxLabel)
+					}
+				}
+
+				// during recording, track consecutive background detections
+				if recording {
+					if verbose {
+						log.Printf("-> RECORDING IS IN PROGRESS")
+					}
+					if maxLabel == "background" {
+						if time.Since(lastNonBackgroundTime) >= recordStopDuration {
+							recording = false
+
+							// Stop recording and Save the File
+							timestamp := time.Now().Format("20060102_150405")
+							filename := filepath.Join(recordDir, fmt.Sprintf("%s_recording.wav", timestamp))
+
+							if err := saveWAVFile(filename, recordingBuffer, recOpts.SampleRate); err != nil {
+								log.Printf("Error saving audio: %v", err)
+							} else {
+								log.Printf("Saved audio recording: %s (%.1f seconds, %d samples)", 
+									filename, 
+									float64(len(recordingBuffer))/float64(recOpts.SampleRate),
+									len(recordingBuffer))
+							}
+						
+							// Clear recording buffer
+							recordingBuffer = nil
+
+							if verbose {
+								log.Printf("STOPPED RECORDING (%.1f seconds of background)", time.Since(lastNonBackgroundTime).Seconds())
+							}
+						}
+					} else {
+						// Reset timer if a non-background label is detected during recording
+						lastNonBackgroundTime = time.Now()
+						if verbose {
+							log.Printf("-> RECORDING TIMER HAS BEEN RESET")
+						}
+					}
+				}
+
 
 				// Only publish to MQTT if:
 				// 1. Label is NOT "background", OR
