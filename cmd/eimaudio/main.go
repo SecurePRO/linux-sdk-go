@@ -35,6 +35,20 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
+// recorderWrapper wraps a recorder to allow audio stream duplication
+type recorderWrapper struct {
+	reader io.Reader
+	closer io.Closer
+}
+
+func (rw *recorderWrapper) Reader() io.Reader {
+	return rw.reader
+}
+
+func (rw *recorderWrapper) Close() error {
+	return rw.closer.Close()
+}
+
 var (
 	listDevices          bool
 	interval             time.Duration
@@ -184,10 +198,65 @@ func main0(args []string) int {
 	}
 	defer recorder.Close()
 
+	/////////
+	//Wrapped Recoder Concept
+
+	// Buffer to store recent audio samples (circular buffer)
+	bufferDuration := 3 * time.Second
+	bufferSize := int(float64(recOpts.SampleRate) * bufferDuration.Seconds())
+	audioBuffer := make([]int16, bufferSize)
+	bufferPos := 0
+
+	// Channel for audio samples
+	audioChan := make(chan []int16, 100)
+
+	// Create a pipe to duplicate the audio stream
+	pipeReader, pipeWriter := io.Pipe()
+
+	// Wrap the recorder's reader to write to both the classifier and our capture
+	go func() {
+		reader := recorder.Reader()
+		buf := make([]byte, 4096)
+	
+		for {
+			n, err := reader.Read(buf)
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("Error reading audio: %v", err)
+				}
+				pipeWriter.Close()
+				close(audioChan)
+				return
+			}
+		
+			// Write to pipe for classifier
+			if _, err := pipeWriter.Write(buf[:n]); err != nil {
+				log.Printf("Error writing to pipe: %v", err)
+				close(audioChan)
+				return
+			}
+			
+			// Convert bytes to int16 samples for our capture
+			numSamples := n / 2
+			samples := make([]int16, numSamples)
+			for i := 0; i < numSamples; i++ {
+				samples[i] = int16(buf[i*2]) | int16(buf[i*2+1])<<8
+			}
+		
+			audioChan <- samples
+		}
+	}()
+
+	wrappedRecorder := &recorderWrapper{
+		reader: pipeReader,
+		closer: recorder,
+	}
+	////////
+
 	copts := &audio.ClassifierOpts{
 		Verbose: verbose,
 	}
-	ac, err := audio.NewClassifier(runner, recorder, interval, copts)
+	ac, err := audio.NewClassifier(runner, wrappedRecorder, interval, copts)
 	if err != nil {
 		log.Printf("new audio classifier: %v", err)
 		return 1
@@ -209,52 +278,18 @@ func main0(args []string) int {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 
-	// Buffer to store recent audio samples (circular buffer)
-	bufferDuration := 3 * time.Second // Capture 3 seconds of audio
-	bufferSize := int(float64(recOpts.SampleRate) * bufferDuration.Seconds())
-	audioBuffer := make([]int16, bufferSize)
-	bufferPos := 0
-
 	// Keep reading classification events.
 	var previousLabel string = "" // Keep track of the previous label to supress 'background' events
 	var recording bool = false
 	var lastNonBackgroundTime time.Time 
 	var recordingBuffer []int16
-
-	// Create a goroutine to continuously read from the recorder
-	audioChan := make(chan []int16, 100)
-	go func() {
-		reader := recorder.Reader()
-		buf := make([]byte, 4096) // Buffer for reading bytes
-	
-		for {
-			n, err := reader.Read(buf)
-			if err != nil {
-				if err != io.EOF {
-					log.Printf("Error reading audio: %v", err)
-				}
-				close(audioChan)
-				return
-			}
-		
-			// Convert bytes to int16 samples (16-bit signed integer, little-endian)
-			numSamples := n / 2
-			samples := make([]int16, numSamples)
-			for i := 0; i < numSamples; i++ {
-				// Little-endian: low byte first, high byte second
-				samples[i] = int16(buf[i*2]) | int16(buf[i*2+1])<<8
-			}
-		
-			audioChan <- samples
-		}
-	}()
 	
 	for {
 		select {
 		case <-signals:
 			return 1
 
-		// Handle incoming audio samples form the recorder
+		// Handle incoming audio samples from the recorder
 		case samples, ok := <-audioChan:
 			if !ok {
 				log.Printf("Audio stream closed")
