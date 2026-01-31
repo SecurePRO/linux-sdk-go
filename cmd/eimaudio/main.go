@@ -56,6 +56,7 @@ var (
 	verbose              bool
 	traceDir             string
 	deviceID             string
+	obsMicrophoneID      string
 	mqTopic              string
 	obsDeviceID          string
 	recordStopDuration   time.Duration
@@ -74,7 +75,8 @@ func init() {
 	flag.StringVar(&obsDeviceID, "obsDeviceID", "", "Sets the device ID in the mqtt topic /device_xxxx/")
 	flag.DurationVar(&recordStopDuration, "recordstop", 10*time.Second, "Duration of continuous background before stopping recording.")
 	flag.BoolVar(&recordOnTrigger, "record", false, "If set, records audio when trigger label is detected.")
-	flag.StringVar(&recordDir, "recorddir", "./recordings", "directory to save audio recordings")
+	flag.StringVar(&recordDir, "recorddir", "/etc/obs_engine/video/audio_clips/", "directory to save audio recordings")
+	flag.StringVar(&obsMicrophoneID, "obsMicrophoneID", "", "Sets the microphone ID for the recorded wav filename.")
 }
 
 func usage() {
@@ -142,6 +144,12 @@ func main0(args []string) int {
 
 	if obsDeviceID == "" {
 		fmt.Println("Error: -obsDeviceID is required")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	if obsMicrophoneID == "" {
+		fmt.Println("Error: -obsMicrophoneID is required")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -363,8 +371,8 @@ func main0(args []string) int {
 							recording = false
 
 							// Stop recording and Save the File
-							timestamp := time.Now().Format("20060102_150405")
-							filename := filepath.Join(recordDir, fmt.Sprintf("%s_recording.wav", timestamp))
+							timestamp := time.Now().Format("20060102150405")
+							filename := filepath.Join(recordDir, fmt.Sprintf("%s_%s.wav", obsMicrophoneID, timestamp))
 
 							if err := saveWAVFile(filename, recordingBuffer, recOpts.SampleRate); err != nil {
 								log.Printf("Error saving audio: %v", err)
